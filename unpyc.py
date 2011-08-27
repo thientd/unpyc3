@@ -49,7 +49,6 @@ def dec_module(path):
     suite = code.get_suite(False)
     suite.display()
 
-
 def indent_print(indent, pattern, *args, **kwargs):
     if args or kwargs:
         pattern = pattern.format(*args, **kwargs)
@@ -852,7 +851,7 @@ class SuiteDecompiler:
         self.write("continue")
     
     def SETUP_FINALLY(self, addr, delta):
-        start_finally = addr[1] + delta
+        start_finally = addr.jump()
         d_try = SuiteDecompiler(addr[1], start_finally)
         d_try.run()
         d_finally = SuiteDecompiler(start_finally)
@@ -864,7 +863,7 @@ class SuiteDecompiler:
         return self.END_NOW
     
     def SETUP_EXCEPT(self, addr, delta):
-        start_except = addr[1] + delta
+        start_except = addr.jump()
         end_try = start_except[-1]
         d_try = SuiteDecompiler(addr[1], start_except[-1])
         d_try.run()
@@ -894,7 +893,7 @@ class SuiteDecompiler:
         return start_except[1]
 
     def SETUP_WITH(self, addr, delta):
-        end_with = addr[1] + delta
+        end_with = addr.jump()
         with_stmt = WithStatement(self.stack.pop())
         d_with = SuiteDecompiler(addr[1], end_with)
         d_with.stack.push(with_stmt)
@@ -932,12 +931,12 @@ class SuiteDecompiler:
             # POP_TOP
             # SETUP_FINALLY if the match was named
             assert addr[1].opcode == POP_JUMP_IF_FALSE
-            left.next_start_except = self.code.address(addr[1].arg)
+            left.next_start_except = addr[1].jump()
             assert addr[2].opcode == POP_TOP
             assert addr[4].opcode == POP_TOP
             if addr[5].opcode == SETUP_FINALLY:
                 except_start = addr[6]
-                except_end = except_start + addr[5].arg
+                except_end = addr[5].jump()
             else:
                 except_start = addr[5]
                 except_end = left.next_start_except[-1]
@@ -1119,21 +1118,25 @@ class SuiteDecompiler:
         posargs = self.stack.pop(pos_argc)
         func = self.stack.pop()
         if func is self.BUILD_CLASS:
+            # It's a class construction
             # TODO: check the assert statement below is correct
             assert not (have_var or have_kw)
             func, name, *parents  = posargs
             self.stack.push(ClassStatement(func, name, parents, kwargs))
         elif isinstance(func, PyComp):
+            # It's a list/set/dict comprehension or generator expression
             assert not (have_var or have_kw)
             assert len(posargs) == 1 and not kwargs
             func.set_iterable(posargs[0])
             self.stack.push(func)
         elif posargs and isinstance(posargs[0], DecorableStatement):
+            # It's a decorator for a def/class statement
             assert len(posargs) == 1 and not kwargs
             defn = posargs[0]
             defn.decorate(func)
             self.stack.push(defn)
         else:
+            # It's none of the above, so it must be a normal function call
             func_call = PyCallFunction(func, posargs, kwargs, varargs, varkw)
             self.stack.push(func_call)
 
@@ -1194,8 +1197,7 @@ class SuiteDecompiler:
         self.stack.push(PyDict())
 
     def STORE_MAP(self, addr):
-        k = self.stack.pop()
-        v = self.stack.pop()
+        v, k = self.stack.pop(2)
         d = self.stack.peek()
         d.set_item(k, v)
 
@@ -1215,7 +1217,7 @@ class SuiteDecompiler:
     # and operator
 
     def JUMP_IF_FALSE_OR_POP(self, addr, target):
-        end_addr = self.code.address(target)
+        end_addr = addr.jump()
         self.push_popjump(True, end_addr, self.stack.pop())
         left = self.pop_popjump()
         if end_addr.opcode == ROT_TWO:
@@ -1247,7 +1249,7 @@ class SuiteDecompiler:
     # or operator
     
     def JUMP_IF_TRUE_OR_POP(self, addr, target):
-        end_addr = self.code.address(target)
+        end_addr = addr.jump()
         self.push_popjump(True, end_addr, self.stack.pop())
         left = self.pop_popjump()
         d = SuiteDecompiler(addr[1], end_addr, self.stack)
@@ -1261,17 +1263,17 @@ class SuiteDecompiler:
     #
 
     def POP_JUMP_IF(self, addr, target, truthiness):
-        jump_addr = self.code.address(target)
+        jump_addr = addr.jump()
         if jump_addr.opcode == FOR_ITER:
             # We are in a for-loop with nothing after the if-suite
             # But take care: for-loops in generator expression do
             # not end in POP_BLOCK, hence the test below.
-            jump_addr = (jump_addr[1] + jump_addr.arg)
+            jump_addr = jump_addr.jump()
             if jump_addr.opcode == POP_BLOCK:
                 jump_addr = jump_addr[-1]
         elif jump_addr[-1].opcode == SETUP_LOOP:
             # We are in a while-loop with nothing after the if-suite
-            jump_addr = (jump_addr + jump_addr[-1].arg)[-2]
+            jump_addr = jump_addr[-1].jump()[-2]
         cond = self.stack.pop()
         if not addr.is_else_jump():
             self.push_popjump(truthiness, jump_addr, cond)
@@ -1304,15 +1306,15 @@ class SuiteDecompiler:
             return jump_addr[1]
         # It's an if-else (expression or statement)
         if end_true.opcode == JUMP_FORWARD:
-            end_false = jump_addr + end_true.arg
+            end_false = end_true.jump()
         elif end_true.opcode == JUMP_ABSOLUTE:
-            end_false = self.code.address(end_true.arg)
+            end_false = end_true.jump()
             if end_false.opcode == FOR_ITER:
                 # We are in a for-loop with nothing after the else-suite
-                end_false = (end_false[1] + end_false.arg)[-1]
+                end_false = end_false.jump()[-1]
             elif end_false[-1].opcode == SETUP_LOOP:
                 # We are in a while-loop with nothing after the else-suite
-                end_false = (end_false + end_false[-1].arg)[-2]
+                end_false = end_false[-1].jump()[-2]
         elif end_true.opcode == RETURN_VALUE:
             # find the next RETURN_VALUE
             end_false = jump_addr
@@ -1328,6 +1330,7 @@ class SuiteDecompiler:
             self.suite.add_statement(stmt)
         else:
             assert len(d_true.stack) == len(d_false.stack) == 1
+            assert not (d_true.suite or d_false.suite)
             true_expr = d_true.stack.pop()
             false_expr = d_false.stack.pop()
             self.stack.push(PyIfElse(cond, true_expr, false_expr))
@@ -1352,7 +1355,7 @@ class SuiteDecompiler:
     
     def FOR_ITER(self, addr, delta):
         iterable = self.stack.pop()
-        jump_addr = addr[1] + delta
+        jump_addr = addr.jump()
         d_body = SuiteDecompiler(addr[1], jump_addr[-1])
         for_stmt = ForStatement(iterable)
         d_body.stack.push(for_stmt)
