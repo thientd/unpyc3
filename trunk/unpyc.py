@@ -791,7 +791,7 @@ class SuiteDecompiler:
         stack = self.popjump_stack
         if jaddr and jaddr[-1].is_else_jump():
             # Increase jaddr to the 'else' address if it jumps to the 'then'
-            jaddr = self.code.address(jaddr[-1].arg)
+            jaddr = jaddr[-1].jump()
         while stack:
             truthiness, addr, cond = stack[-1]
             if jaddr < addr or jaddr == addr:
