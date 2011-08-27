@@ -357,6 +357,13 @@ class PyCompare(PyExpr):
     def __str__(self):
         return " ".join(x if i%2 else x.wrap(x.precedence <= 0)
                         for i, x in enumerate(self.complist))
+    def extends(self, other):
+        if not isinstance(other, PyCompare):
+            return False
+        else:
+            return self.complist[0] == other.complist[-1]
+    def chain(self, other):
+        return PyCompare(self.complist + other.complist[1:])
 
 class PyBooleanAnd(PyBinaryOp):
     precedence = 4
@@ -546,6 +553,7 @@ class Unpack:
 
 
 class Import:
+    # TODO: change this to an ImportStatement
     def __init__(self, name, level, fromlist):
         self.name = name
         self.level = level
@@ -574,15 +582,6 @@ class ImportFrom:
         imp = dec.stack.peek()
         assert isinstance(imp, Import)
         imp.aslist.append(dest.name)
-
-
-class ForArg:
-    def __init__(self, decompiler, iterable):
-        self.decompiler = decompiler
-        self.iterable = iterable
-    def store(self, dest):
-        self.decompiler.write("for {} in {}", dest, self.iterable)
-        self.decompiler.indent()
 
 
 class SimpleStatement:
@@ -637,21 +636,27 @@ class WhileStatement:
         indent_print(indent, "while {}:", self.cond)
         self.body.display(indent + 1)
 
-class DefStatement(FunctionDefinition):
-    def __init__(self, code, default_arguments, closure):
-        super().__init__(code, default_arguments, closure)
+class DecorableStatement:
+    def __init__(self):
         self.decorators = []
     def display(self, indent=0):
         for f in reversed(self.decorators):
             indent_print(indent, "@{}", f)
+        self.display_undecorated(indent)
+    def decorate(self, f):
+        self.decorators.append(f)
+
+class DefStatement(FunctionDefinition, DecorableStatement):
+    def __init__(self, code, default_arguments, closure):
+        FunctionDefinition.__init__(self, code, default_arguments, closure)
+        DecorableStatement.__init__(self)
+    def display_undecorated(self, indent=0):
         paramlist = ", ".join(self.getparams())
         indent_print(indent, "def {}({}):", self.name, paramlist)
         self.code.get_suite().display(indent + 1)
     def store(self, dec, dest):
         self.name = dest
         dec.suite.add_statement(self)
-    def decorate(self, f):
-        self.decorators.append(f)
 
 class TryStatement:
     def __init__(self, try_suite):
@@ -716,15 +721,16 @@ class WithStatement:
             indent_print(indent, "with {}:", ", ".join(args))
             self.suite.display(indent + 1)
 
-class ClassStatement:
+class ClassStatement(DecorableStatement):
     def __init__(self, func, name, parents, kwargs):
+        DecorableStatement.__init__(self)
         self.func = func
         self.parents = parents
         self.kwargs = kwargs
     def store(self, dec, dest):
         self.name = dest
         dec.suite.add_statement(self)
-    def display(self, indent=0):
+    def display_undecorated(self, indent=0):
         if self.parents or self.kwargs:
             args = [str(x) for x in self.parents]
             kwargs = ["{}={}".format(k.val, v) for k, v in self.kwargs]
@@ -763,15 +769,7 @@ class Suite:
         self.statements.append(stmt)
 
 
-class Decompiler:
-    def __init__(self, start_addr, end_addr=None, stack=None):
-        self.start_addr = start_addr
-        self.end_addr = end_addr
-        self.code = start_addr.code
-        self.stack = Stack() if stack is None else stack
-
-
-class SuiteDecompiler(Decompiler):
+class SuiteDecompiler:
 
     # An instruction handler can return this to indicate to the run()
     # function that it should return immediately
@@ -781,7 +779,10 @@ class SuiteDecompiler(Decompiler):
     BUILD_CLASS = object()
     
     def __init__(self, start_addr, end_addr=None, stack=None):
-        super().__init__(start_addr, end_addr, stack)
+        self.start_addr = start_addr
+        self.end_addr = end_addr
+        self.code = start_addr.code
+        self.stack = Stack() if stack is None else stack
         self.suite = Suite()
         self.assignment_chain = []
         self.popjump_stack = []
@@ -1127,7 +1128,7 @@ class SuiteDecompiler(Decompiler):
             assert len(posargs) == 1 and not kwargs
             func.set_iterable(posargs[0])
             self.stack.push(func)
-        elif posargs and isinstance(posargs[0], DefStatement):
+        elif posargs and isinstance(posargs[0], DecorableStatement):
             assert len(posargs) == 1 and not kwargs
             defn = posargs[0]
             defn.decorate(func)
@@ -1224,9 +1225,8 @@ class SuiteDecompiler(Decompiler):
         d = SuiteDecompiler(addr[1], end_addr, self.stack)
         d.run()
         right = self.stack.pop()
-        if (isinstance(left, PyCompare) and isinstance(right, PyCompare)
-                and left.complist[-1] is right.complist[0]):
-            py_and = PyCompare(left.complist + right.complist[1:])
+        if isinstance(right, PyCompare) and right.extends(left):
+            py_and = left.chain(right)
         else:
             py_and = PyBooleanAnd(left, right)
         self.stack.push(py_and)
@@ -1383,12 +1383,15 @@ class SuiteDecompiler(Decompiler):
 
     def RAISE_VARARGS(self, addr, argc):
         # TODO: find out when argc is 2 or 3
-        # Answer: In Python 3, only 0 or 1 argument (see PEP 3109)
+        # Answer: In Python 3, only 0, 1, or 2 argument (see PEP 3109)
         if argc == 0:
             self.write("raise")
         elif argc == 1:
             exception = self.stack.pop()
             self.write("raise {}", exception)
+        elif argc == 2:
+            exc, from_exc = self.stack.pop()
+            self.write("raise {} from {}". exc, from_exc)
         else:
             raise Unknown
 
