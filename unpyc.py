@@ -1,9 +1,13 @@
+# TODO:
+# - Support for keyword-only arguments
+
 from itertools import starmap
 from collections import defaultdict
 import dis
 from array import array
 from opcode import opname, opmap, HAVE_ARGUMENT, cmp_op
 import imp
+import inspect
 
 # Masks for code object's co_flag attribute
 VARARGS = 4
@@ -13,6 +17,9 @@ VARKEYWORDS = 8
 for name, val in opmap.items():
     globals()[name] = val
 
+# These opcodes will generate a statement. This is used in the first
+# pass (in Code.find_else) to find which POP_JUMP_IF_* instructions
+# are jumps to the else clause of an if statement
 stmt_opcodes = {
     SETUP_LOOP, BREAK_LOOP, CONTINUE_LOOP,
     SETUP_FINALLY, END_FINALLY,
@@ -46,13 +53,44 @@ def dec_module(path):
     stream = open(pyc_path, "rb")
     code_obj = read_code(stream)
     code = Code(code_obj)
-    suite = code.get_suite(False)
-    suite.display()
+    return code.get_suite(False)
 
-def indent_print(indent, pattern, *args, **kwargs):
-    if args or kwargs:
-        pattern = pattern.format(*args, **kwargs)
-    print(" "*4*indent + pattern)
+
+def decompile(obj):
+    if inspect.isfunction(obj):
+        code = Code(obj.__code__)
+        defaults = obj.__defaults__
+        return DefStatement(code, defaults, obj.__closure__)
+
+
+class Indent:
+    def __init__(self, indent_level=0, indent_step=4):
+        self.level = indent_level
+        self.step = indent_step
+    def write(self, pattern, *args, **kwargs):
+        if args or kwargs:
+            pattern = pattern.format(*args, **kwargs)
+        return self.indent(pattern)
+    def __add__(self, indent_increase):
+        return type(self)(self.level + indent_increase, self.step)
+
+class IndentPrint(Indent):
+    def indent(self, string):
+        print(" "*self.step*self.level + string)
+
+class IndentString(Indent):
+    def __init__(self, indent_level=0, indent_step=4, lines=None):
+        Indent.__init__(self, indent_level, indent_step)
+        if lines is None:
+            self.lines = []
+        else:
+            self.lines = lines
+    def __add__(self, indent_increase):
+        return type(self)(self.level + indent_increase, self.step, self.lines)
+    def indent(self, string):
+        self.lines.append(" "*self.step*self.level + string)
+    def __str__(self):
+        return "\n".join(self.lines)
 
 
 class Stack:
@@ -92,8 +130,8 @@ class Stack:
             return self._stack[-1]
         else:
             return self._stack[-count:]
-    
-            
+
+
 def code_walker(code):
     l = len(code)
     code = array('B', code)
@@ -108,8 +146,9 @@ def code_walker(code):
             i += 1
 
 class Code:
-    def __init__(self, code_obj):
+    def __init__(self, code_obj, parent=None):
         self.code_obj = code_obj
+        self.parent = parent
         self.derefnames = [PyName(v)
                            for v in code_obj.co_cellvars + code_obj.co_freevars]
         self.consts = list(map(PyConst, code_obj.co_consts))
@@ -132,6 +171,8 @@ class Code:
             print(addr)
     def address(self, addr):
         return self[self.instr_map[addr]]
+    def iscellvar(self, i):
+        return i < len(self.code_obj.co_cellvars)
     def find_else(self):
         jumps = {}
         last_jump = None
@@ -176,6 +217,12 @@ class Code:
     def declare_global(self, name):
         if name not in self.globals:
             self.globals.append(name)
+    def ensure_global(self, name):
+        parent = self.parent
+        while parent:
+            if name in parent.varnames:
+                return self.declare_global(name)
+            parent = parent.parent
     def declare_nonlocal(self, name):
         if name not in self.nonlocals:
             self.nonlocals.append(name)
@@ -297,6 +344,8 @@ class PyName(PyExpr):
         self.name = name
     def __str__(self):
         return self.name
+    def __eq__(self, other):
+        return isinstance(other, type(self)) and self.name == other.name
 
 class PyUnaryOp(PyExpr):
     def __init__(self, operand):
@@ -410,7 +459,8 @@ class PyCallFunction(PyExpr):
                 # Only one pair of brackets arount a single arg genexpr
                 return "{}{}".format(funcstr, arg)
         args = [x.wrap(x.precedence <= 0) for x in self.args]
-        args.extend("{}={}".format(k.val, v.wrap(v.precedence <= 0)) for k, v in self.kwargs)
+        args.extend("{}={}".format(k.val, v.wrap(v.precedence <= 0))
+                    for k, v in self.kwargs)
         if self.varargs is not None:
             args.append("*{}".format(self.varargs))
         if self.varkw is not None:
@@ -426,8 +476,9 @@ class FunctionDefinition:
         code_obj = self.code.code_obj
         l = code_obj.co_argcount
         params = list(code_obj.co_varnames[:l])
-        for i, arg in enumerate(reversed(self.default_arguments)):
-            params[-i - 1] = "{}={}".format(params[-i - 1], arg)
+        if self.default_arguments:
+            for i, arg in enumerate(reversed(self.default_arguments)):
+                params[-i - 1] = "{}={}".format(params[-i - 1], arg)
         if code_obj.co_flags & VARARGS:
             params.append("*" + code_obj.co_varnames[l])
             l += 1
@@ -487,6 +538,16 @@ class PyYield(PyExpr):
     def __str__(self):
         return "yield {}".format(self.value)
 
+class PyStarred(PyExpr):
+    """Used in unpacking assigments"""
+    precedence = 15
+    def __init__(self, expr):
+        self.expr = expr
+    def __str__(self):
+        es = self.expr.wrap(self.expr.precedence < self.precedence)
+        return "*{}".format(es)
+
+
 code_map = {
     '<lambda>': PyLambda,
     '<listcomp>': PyListComp,
@@ -519,25 +580,24 @@ binary_ops = [
 ]
 
 
-class InPlaceOp:
+class PyStatement:
+    def __str__(self):
+        istr = IndentString()
+        self.display(istr)
+        return str(istr)
+
+class InPlaceOp(PyStatement):
     def __init__(self, left, right):
         self.right = right
         self.left = left
     def store(self, dec, dest):
         # assert dest is self.left
-        dec.write(self.pattern.format(self.left, self.right))
-
-class PyStarred(PyExpr):
-    precedence = 15
-    def __init__(self, expr):
-        self.expr = expr
-    def __str__(self):
-        es = self.expr.wrap(self.expr.precedence < self.precedence)
-        return "*{}".format(es)
+        dec.suite.add_statement(self)
+    def display(self, indent):
+        indent.write(self.pattern, self.left, self.right)
 
 class Unpack:
-    def __init__(self, decompiler, val, length, star_index=None):
-        self.decompiler = decompiler
+    def __init__(self, val, length, star_index=None):
         self.val = val
         self.length = length
         self.star_index = star_index
@@ -550,56 +610,60 @@ class Unpack:
             dec.stack.push(self.val)
             dec.store(PyTuple(self.dests))
 
-
-class Import:
-    # TODO: change this to an ImportStatement
+class ImportStatement(PyStatement):
     def __init__(self, name, level, fromlist):
         self.name = name
         self.level = level
         self.fromlist = fromlist
         self.aslist = []
     def store(self, dec, dest):
-        name = self.name.name
-        alias = dest.name
-        if name == alias or name.startswith(alias + "."):
-            dec.write("import {}", name)
-        else:
-            dec.write("import {} as {}", name, alias)
+        self.alias = dest
+        dec.suite.add_statement(self)
     def on_pop(self, dec):
-        names = []
-        for name, alias in zip(self.fromlist, self.aslist):
-            if name == alias:
-                names.append(name)
+        dec.suite.add_statement(self)
+    def display(self, indent):
+        if self.fromlist == PyConst(None):
+            name = self.name.name
+            alias = self.alias.name
+            if name == alias or name.startswith(alias + "."):
+                indent.write("import {}", name)
             else:
-                names.append("{} as {}".format(name, alias))
-        dec.write("from {} import {}", self.name, ", ".join(names))
-
+                indent.write("import {} as {}", name, alias)
+        else:
+            names = []
+            for name, alias in zip(self.fromlist, self.aslist):
+                if name == alias:
+                    names.append(name)
+                else:
+                    names.append("{} as {}".format(name, alias))
+            indent.write("from {} import {}", self.name, ", ".join(names))
+            
 class ImportFrom:
     def __init__(self, name):
         self.name = name
     def store(self, dec, dest):
         imp = dec.stack.peek()
-        assert isinstance(imp, Import)
+        assert isinstance(imp, ImportStatement)
         imp.aslist.append(dest.name)
 
 
-class SimpleStatement:
+class SimpleStatement(PyStatement):
     def __init__(self, val):
         assert val is not None
         self.val = val
-    def display(self, indent=0):
-        indent_print(indent, self.val)
+    def display(self, indent):
+        indent.write(self.val)
     def gen_display(self, seq=()):
         return " ".join((self.val,) + seq)
 
-class IfStatement:
+class IfStatement(PyStatement):
     def __init__(self, cond, true_suite, false_suite):
         self.cond = cond
         self.true_suite = true_suite
         self.false_suite = false_suite
-    def display(self, indent=0, is_elif=False):
+    def display(self, indent, is_elif=False):
         ptn = "elif {}:" if is_elif else "if {}:"
-        indent_print(indent, ptn, self.cond)
+        indent.write(ptn, self.cond)
         self.true_suite.display(indent + 1)
         if not self.false_suite:
             return
@@ -608,39 +672,39 @@ class IfStatement:
             if isinstance(stmt, IfStatement):
                 stmt.display(indent, is_elif=True)
                 return
-        indent_print(indent, "else:")
+        indent.write("else:")
         self.false_suite.display(indent + 1)
     def gen_display(self, seq=()):
         assert not self.false_suite
         s = "if {}".format(self.cond)
         return self.true_suite.gen_display(seq + (s,))
 
-class ForStatement:
+class ForStatement(PyStatement):
     def __init__(self, iterable):
         self.iterable = iterable
     def store(self, dec, dest):
         self.dest = dest
-    def display(self, indent=0):
-        indent_print(indent, "for {} in {}:", self.dest, self.iterable)
+    def display(self, indent):
+        indent.write("for {} in {}:", self.dest, self.iterable)
         self.body.display(indent + 1)
     def gen_display(self, seq=()):
         s = "for {} in {}".format(self.dest, self.iterable)
         return self.body.gen_display(seq + (s,))
 
-class WhileStatement:
+class WhileStatement(PyStatement):
     def __init__(self, cond, body):
         self.cond = cond
         self.body = body
-    def display(self, indent=0):
-        indent_print(indent, "while {}:", self.cond)
+    def display(self, indent):
+        indent.write("while {}:", self.cond)
         self.body.display(indent + 1)
 
-class DecorableStatement:
+class DecorableStatement(PyStatement):
     def __init__(self):
         self.decorators = []
-    def display(self, indent=0):
+    def display(self, indent):
         for f in reversed(self.decorators):
-            indent_print(indent, "@{}", f)
+            indent.write("@{}", f)
         self.display_undecorated(indent)
     def decorate(self, f):
         self.decorators.append(f)
@@ -649,15 +713,16 @@ class DefStatement(FunctionDefinition, DecorableStatement):
     def __init__(self, code, default_arguments, closure):
         FunctionDefinition.__init__(self, code, default_arguments, closure)
         DecorableStatement.__init__(self)
-    def display_undecorated(self, indent=0):
+    def display_undecorated(self, indent):
         paramlist = ", ".join(self.getparams())
-        indent_print(indent, "def {}({}):", self.name, paramlist)
+        indent.write("def {}({}):", self.code.name, paramlist)
         self.code.get_suite().display(indent + 1)
+        indent.write("")
     def store(self, dec, dest):
         self.name = dest
         dec.suite.add_statement(self)
 
-class TryStatement:
+class TryStatement(PyStatement):
     def __init__(self, try_suite):
         self.try_suite = try_suite
         self.except_clauses = []
@@ -665,23 +730,23 @@ class TryStatement:
         self.except_clauses.append([type, None, suite])
     def store(self, dec, dest):
         self.except_clauses[-1][1] = dest
-    def display(self, indent=0):
-        indent_print(indent, "try:")
+    def display(self, indent):
+        indent.write("try:")
         self.try_suite.display(indent + 1)
         for type, name, suite in self.except_clauses:
             if type is None:
-                indent_print(indent, "except:")
+                indent.write("except:")
             elif name is None:
-                indent_print(indent, "except {}:", type)
+                indent.write("except {}:", type)
             else:
-                indent_print(indent, "except {} as {}:", type, name)
+                indent.write("except {} as {}:", type, name)
             suite.display(indent + 1)
 
-class FinallyStatement:
+class FinallyStatement(PyStatement):
     def __init__(self, try_suite, finally_suite):
         self.try_suite = try_suite
         self.finally_suite = finally_suite
-    def display(self, indent=0):
+    def display(self, indent):
         # Wrap the try suite in a TryStatement if necessary
         try_stmt = None
         if len(self.try_suite) == 1:
@@ -691,16 +756,16 @@ class FinallyStatement:
         if try_stmt is None:
             try_stmt = TryStatement(self.try_suite)
         try_stmt.display(indent)
-        indent_print(indent, "finally:")
+        indent.write("finally:")
         self.finally_suite.display(indent + 1)
 
-class WithStatement:
+class WithStatement(PyStatement):
     def __init__(self, with_expr):
         self.with_expr = with_expr
         self.with_name = None
     def store(self, dec, dest):
         self.with_name = dest
-    def display(self, indent=0, args=None):
+    def display(self, indent, args=None):
         # args to take care of nested withs:
         # with x as t:
         #     with y as u:
@@ -717,7 +782,7 @@ class WithStatement:
         if len(self.suite) == 1 and isinstance(self.suite[0], WithStatement):
             self.suite[0].display(indent, args)
         else:
-            indent_print(indent, "with {}:", ", ".join(args))
+            indent.write("with {}:", ", ".join(args))
             self.suite.display(indent + 1)
 
 class ClassStatement(DecorableStatement):
@@ -729,14 +794,14 @@ class ClassStatement(DecorableStatement):
     def store(self, dec, dest):
         self.name = dest
         dec.suite.add_statement(self)
-    def display_undecorated(self, indent=0):
+    def display_undecorated(self, indent):
         if self.parents or self.kwargs:
             args = [str(x) for x in self.parents]
             kwargs = ["{}={}".format(k.val, v) for k, v in self.kwargs]
             all_args = ", ".join(args + kwargs)
-            indent_print(indent, "class {}({}):", self.name, all_args)
+            indent.write("class {}({}):", self.name, all_args)
         else:
-            indent_print(indent, "class {}:", self.name)
+            indent.write("class {}:", self.name)
         suite = self.func.code.get_suite()
         # TODO: find out why sometimes the class suite ends with
         # "return __class__"
@@ -745,6 +810,7 @@ class ClassStatement(DecorableStatement):
             if last_stmt.val.startswith("return "):
                 suite.statements.pop()
         suite.display(indent + 1)
+        indent.write("")
 
 class Suite:
     def __init__(self):
@@ -755,12 +821,16 @@ class Suite:
         return len(self.statements)
     def __getitem__(self, i):
         return self.statements[i]
-    def display(self, indent=0):
+    def __str__(self):
+        istr = IndentString()
+        self.display(istr)
+        return str(istr)
+    def display(self, indent):
         if self.statements:
             for stmt in self.statements:
                 stmt.display(indent)
         else:
-            indent_print(indent, "pass")
+            indent.write("pass")
     def gen_display(self, seq=()):
         assert len(self) == 1
         return self[0].gen_display(seq)
@@ -999,18 +1069,21 @@ class SuiteDecompiler:
 
     def STORE_DEREF(self, addr, i):
         name = self.code.derefnames[i]
-        self.code.declare_nonlocal(name)
+        if not self.code.iscellvar(i):
+            self.code.declare_nonlocal(name)
         self.store(name)
 
     def DELETE_DEREF(self, addr, i):
         name = self.code.getderefname(i)
-        self.code.declare_nonlocal(name)
+        if not self.code.iscellvar(i):
+            self.code.declare_nonlocal(name)
         self.write("del {}", name)
     
     # GLOBAL
     
     def LOAD_GLOBAL(self, addr, namei):
         name = self.code.names[namei]
+        self.code.ensure_global(name)
         self.stack.push(name)
 
     def STORE_GLOBAL(self, addr, namei):
@@ -1077,7 +1150,7 @@ class SuiteDecompiler:
     def IMPORT_NAME(self, addr, namei):
         name = self.code.names[namei]
         level, fromlist = self.stack.pop(2)
-        self.stack.push(Import(name, level, fromlist))
+        self.stack.push(ImportStatement(name, level, fromlist))
     
     def IMPORT_FROM(self, addr, namei):
         name = self.code.names[namei]
@@ -1152,7 +1225,7 @@ class SuiteDecompiler:
     # a, b, ... = ...
     
     def UNPACK_SEQUENCE(self, addr, count):
-        unpack = Unpack(self, self.stack.pop(), count)
+        unpack = Unpack(self.stack.pop(), count)
         for i in range(count):
             self.stack.push(unpack)
 
@@ -1160,7 +1233,7 @@ class SuiteDecompiler:
         rcount = counts >> 8
         lcount = counts & 0xFF
         count = lcount + rcount + 1
-        unpack = Unpack(self, self.stack.pop(), count, lcount)
+        unpack = Unpack(self.stack.pop(), count, lcount)
         for i in range(count):
             self.stack.push(unpack)
     
@@ -1168,7 +1241,7 @@ class SuiteDecompiler:
 
     def ROT_TWO(self, addr):
         val = PyTuple(self.stack.pop(2))
-        unpack = Unpack(self, val, 2)
+        unpack = Unpack(val, 2)
         self.stack.push(unpack)
         self.stack.push(unpack)
 
@@ -1367,7 +1440,7 @@ class SuiteDecompiler:
     # Function creation
 
     def MAKE_FUNCTION(self, addr, argc, is_closure=False):
-        code = Code(self.stack.pop().val)
+        code = Code(self.stack.pop().val, self.code)
         closure = self.stack.pop() if is_closure else None
         default_args = self.stack.pop(argc)
         func_maker = code_map.get(code.name, DefStatement)
@@ -1444,13 +1517,6 @@ def test_suite():
         z = 1 if not x else 2
         a = b = 3
         x[y.z] = a, b = u
-        import module
-        import module as bar
-        from module import foo
-        import mod.a
-        import mod1, mod2
-        from mod import a, b as bb
-        from mod import c
         if x:
             f(x)
             del x
