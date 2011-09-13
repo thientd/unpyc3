@@ -2,7 +2,7 @@
 Decompiler for Python3.2.
 Decompile a module or a function using the decompile() function
 
->>> from unpyc import decompile
+>>> from unpyc3 import decompile
 >>> def foo(x, y, z=3, *args):
 ...    global g
 ...    for i, j in zip(x, y):
