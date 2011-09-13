@@ -1,5 +1,32 @@
+"""
+Decompiler for Python3.2.
+Decompile a module or a function using the decompile() function
+
+>>> from unpyc import decompile
+>>> def foo(x, y, z=3, *args):
+...    global g
+...    for i, j in zip(x, y):
+...        if z == i + j or args[i] == j:
+...            g = i, j
+...            return
+...    
+>>> print(decompile(foo))
+
+def foo(x, y, z=3, *args):
+    global g
+    for i, j in zip(x, y):
+        if z == i + j or args[i] == j:
+            g = i, j
+            return
+>>>
+"""
+
+__all__ = ['decompile']
+
 # TODO:
 # - Support for keyword-only arguments
+# - Handle assert statements
+# - Show docstrings for functions and modules
 
 from itertools import starmap
 from collections import defaultdict
@@ -36,7 +63,19 @@ stmt_opcodes = {
     RAISE_VARARGS,
     POP_TOP,
 }
-    
+
+# Conditional branching opcode that make up if statements and and/or
+# expressions
+
+pop_jump_if_opcodes = (POP_JUMP_IF_TRUE, POP_JUMP_IF_FALSE)
+
+# These opcodes indicate that a pop_jump_if_x to the address just
+# after them is an else-jump
+else_jump_opcodes = (
+    JUMP_FORWARD, RETURN_VALUE, JUMP_ABSOLUTE,
+    SETUP_LOOP, RAISE_VARARGS
+)
+
 def read_code(stream): 
     # This helper is needed in order for the PEP 302 emulation to 
     # correctly handle compiled files
@@ -49,19 +88,36 @@ def read_code(stream):
     return marshal.load(stream)
 
 def dec_module(path):
-    pyc_path = imp.cache_from_source(path)
+    if path.endswith(".py"):
+        pyc_path = imp.cache_from_source(path)
+    elif not path.endswith(".pyc"):
+        raise ValueError("path must point to a .py or .pyc file")
     stream = open(pyc_path, "rb")
     code_obj = read_code(stream)
     code = Code(code_obj)
-    return code.get_suite(False)
+    return code.get_suite(include_declarations=False)
 
 
 def decompile(obj):
+    """
+    Decompile obj if it is a module object, a function or a
+    code object. If obj is a string, it is assumed to be the path
+    to a python module.
+    """
+    if isinstance(obj, str):
+        return dec_module(obj)
+    if inspect.iscode(obj):
+        code = Code(obj)
+        return code.get_suite()
     if inspect.isfunction(obj):
         code = Code(obj.__code__)
         defaults = obj.__defaults__
         return DefStatement(code, defaults, obj.__closure__)
-
+    elif inspect.ismodule(obj):
+        return dec_module(obj.__file__)
+    else:
+        msg = "Object must be string, module, function or code object"
+        raise TypeError(msg)
 
 class Indent:
     def __init__(self, indent_level=0, indent_step=4):
@@ -178,9 +234,10 @@ class Code:
         last_jump = None
         for addr in self:
             opcode, arg = addr
-            if opcode in (POP_JUMP_IF_TRUE, POP_JUMP_IF_FALSE):
+            if opcode in pop_jump_if_opcodes:
                 jump_addr = self.address(arg)
-                if jump_addr[-1].opcode in (JUMP_FORWARD, RETURN_VALUE, JUMP_ABSOLUTE, SETUP_LOOP, RAISE_VARARGS) or jump_addr.opcode == FOR_ITER:
+                if (jump_addr[-1].opcode in else_jump_opcodes
+                    or jump_addr.opcode == FOR_ITER):
                     last_jump = addr
                     jumps[jump_addr] = addr
             elif opcode == JUMP_ABSOLUTE:
@@ -215,15 +272,29 @@ class Code:
         else:
             return dec.suite
     def declare_global(self, name):
+        """
+        Declare name as a global.  Called by STORE_GLOBAL and
+        DELETE_GLOBAL
+        """
         if name not in self.globals:
             self.globals.append(name)
     def ensure_global(self, name):
+        """
+        Declare name as global only if it is also a local variable
+        name in one of the surrounding code objects.  This is called
+        by LOAD_GLOBAL
+        """
         parent = self.parent
         while parent:
             if name in parent.varnames:
                 return self.declare_global(name)
             parent = parent.parent
     def declare_nonlocal(self, name):
+        """
+        Declare name as nonlocal.  Called by STORE_DEREF and
+        DELETE_DEREF (but only when the name denotes a free variable,
+        not a cell one).
+        """
         if name not in self.nonlocals:
             self.nonlocals.append(name)
 
@@ -703,6 +774,7 @@ class DecorableStatement(PyStatement):
     def __init__(self):
         self.decorators = []
     def display(self, indent):
+        indent.write("") # Empty line
         for f in reversed(self.decorators):
             indent.write("@{}", f)
         self.display_undecorated(indent)
@@ -717,7 +789,6 @@ class DefStatement(FunctionDefinition, DecorableStatement):
         paramlist = ", ".join(self.getparams())
         indent.write("def {}({}):", self.code.name, paramlist)
         self.code.get_suite().display(indent + 1)
-        indent.write("")
     def store(self, dec, dest):
         self.name = dest
         dec.suite.add_statement(self)
@@ -805,12 +876,12 @@ class ClassStatement(DecorableStatement):
         suite = self.func.code.get_suite()
         # TODO: find out why sometimes the class suite ends with
         # "return __class__"
-        last_stmt = suite.statements[-1]
-        if isinstance(last_stmt, SimpleStatement):
-            if last_stmt.val.startswith("return "):
-                suite.statements.pop()
+        if suite:
+            last_stmt = suite[-1]
+            if isinstance(last_stmt, SimpleStatement):
+                if last_stmt.val.startswith("return "):
+                    suite.statements.pop()
         suite.display(indent + 1)
-        indent.write("")
 
 class Suite:
     def __init__(self):
@@ -910,6 +981,10 @@ class SuiteDecompiler:
     def store(self, dest):
         val = self.stack.pop()
         val.store(self, dest)
+
+    #
+    # All opcode methods in CAPS below.
+    #
 
     def SETUP_LOOP(self, addr, delta):
         pass
@@ -1419,6 +1494,7 @@ class SuiteDecompiler:
         # print("*** JUMP ABSOLUTE ***", addr)
         # return addr.jump()
         pass
+    
     #
     # For loops
     #
@@ -1668,6 +1744,9 @@ def test_suite():
     def foo():
         @decorate
         def f(): pass
+        @foo
+        @bar.baz(3)
+        class A: pass
     def foo():
         class B(A):
             def foo(): pass
