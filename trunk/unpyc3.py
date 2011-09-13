@@ -27,6 +27,7 @@ __all__ = ['decompile']
 # - Support for keyword-only arguments
 # - Handle assert statements
 # - Show docstrings for functions and modules
+# - Nice spacing between function/class declarations
 
 from itertools import starmap
 from collections import defaultdict
@@ -312,7 +313,10 @@ class Address:
                  and self.code == other.code and self.index < other.index)
     def __str__(self):
         mark = "*" if self in self.code.else_jumps else " "
-        return "{} {} {} {}".format(mark, self.addr, opname[self.opcode], self.arg or "")
+        return "{} {} {} {}".format(
+            mark, self.addr,
+            opname[self.opcode], self.arg or ""
+        )
     def __add__(self, delta):
         return self.code.address(self.addr + delta)
     def __getitem__(self, index):
@@ -524,7 +528,8 @@ class PyCallFunction(PyExpr):
         self.varkw = varkw
     def __str__(self):
         funcstr = self.func.wrap(self.func.precedence < self.precedence)
-        if len(self.args) == 1 and not (self.kwargs or self.varargs or self.varkw):
+        if len(self.args) == 1 and not (self.kwargs or self.varargs
+                                         or self.varkw):
             arg = self.args[0]
             if isinstance(arg, PyGenExpr):
                 # Only one pair of brackets arount a single arg genexpr
@@ -567,7 +572,7 @@ class PyLambda(PyExpr, FunctionDefinition):
 
 class PyComp(PyExpr):
     """
-    Abstraction for list, set, dict comprehensionsand generator expressions
+    Abstraction for list, set, dict comprehensions and generator expressions
     """
     precedence = 16
     def __init__(self, code, default_args, closure):
@@ -774,7 +779,7 @@ class DecorableStatement(PyStatement):
     def __init__(self):
         self.decorators = []
     def display(self, indent):
-        indent.write("") # Empty line
+        # indent.write("") # Empty line
         for f in reversed(self.decorators):
             indent.write("@{}", f)
         self.display_undecorated(indent)
