@@ -84,7 +84,7 @@ def read_code(stream):
     import marshal 
     magic = stream.read(4) 
     if magic != imp.get_magic(): 
-        return None 
+        print("*** Warning: file has wrong magic number ***")
     stream.read(4) # Skip timestamp 
     return marshal.load(stream)
 
@@ -705,6 +705,8 @@ class ImportStatement(PyStatement):
                 indent.write("import {}", name)
             else:
                 indent.write("import {} as {}", name, alias)
+        elif self.fromlist == PyConst(('*',)):
+            indent.write("from {} import *", self.name.name)
         else:
             names = []
             for name, alias in zip(self.fromlist, self.aslist):
@@ -1236,6 +1238,9 @@ class SuiteDecompiler:
         name = self.code.names[namei]
         self.stack.push(ImportFrom(name))
 
+    def IMPORT_STAR(self, addr):
+        self.POP_TOP(addr)
+    
     #
     # Function call
     #
