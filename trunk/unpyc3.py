@@ -90,10 +90,10 @@ def read_code(stream):
 
 def dec_module(path):
     if path.endswith(".py"):
-        pyc_path = imp.cache_from_source(path)
+        path = imp.cache_from_source(path)
     elif not path.endswith(".pyc"):
         raise ValueError("path must point to a .py or .pyc file")
-    stream = open(pyc_path, "rb")
+    stream = open(path, "rb")
     code_obj = read_code(stream)
     code = Code(code_obj)
     return code.get_suite(include_declarations=False)
