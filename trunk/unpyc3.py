@@ -25,12 +25,9 @@ __all__ = ['decompile']
 
 # TODO:
 # - Support for keyword-only arguments
-# - Handle assert statements
-# - Show docstrings for functions and modules
-# - Nice spacing between function/class declarations
+# - Handle assert statements better
+# - (Partly done) Nice spacing between function/class declarations
 
-from itertools import starmap
-from collections import defaultdict
 import dis
 from array import array
 from opcode import opname, opmap, HAVE_ARGUMENT, cmp_op
@@ -67,7 +64,6 @@ stmt_opcodes = {
 
 # Conditional branching opcode that make up if statements and and/or
 # expressions
-
 pop_jump_if_opcodes = (POP_JUMP_IF_TRUE, POP_JUMP_IF_FALSE)
 
 # These opcodes indicate that a pop_jump_if_x to the address just
@@ -96,7 +92,7 @@ def dec_module(path):
     stream = open(path, "rb")
     code_obj = read_code(stream)
     code = Code(code_obj)
-    return code.get_suite(include_declarations=False)
+    return code.get_suite(include_declarations=False, look_for_docstring=True)
 
 
 def decompile(obj):
@@ -144,11 +140,13 @@ class IndentString(Indent):
             self.lines = lines
     def __add__(self, indent_increase):
         return type(self)(self.level + indent_increase, self.step, self.lines)
+    def sep(self):
+        if not self.lines or self.lines[-1]:
+            self.lines.append("")
     def indent(self, string):
         self.lines.append(" "*self.step*self.level + string)
     def __str__(self):
         return "\n".join(self.lines)
-
 
 class Stack:
     def __init__(self):
@@ -256,9 +254,15 @@ class Code:
                 # that the last POP_JUMP_IF_x was an else-jump
                 jumps[addr] = last_jump
         self.else_jumps = set(jumps.values())
-    def get_suite(self, include_declarations=True):
+    def get_suite(self, include_declarations=True, look_for_docstring=False):
         dec = SuiteDecompiler(self[0])
         dec.run()
+        first_stmt = dec.suite and dec.suite[0]
+        # Change __doc__ = "docstring" to "docstring"
+        if look_for_docstring and isinstance(first_stmt, AssignStatement):
+            chain = first_stmt.chain
+            if len(chain) == 2 and str(chain[0]) == "__doc__":
+                dec.suite[0] = DocString(first_stmt.chain[1].val)
         if include_declarations and (self.globals or self.nonlocals):
             suite = Suite()
             if self.globals:
@@ -349,8 +353,8 @@ class PyExpr:
         chain.append(dest)
         if self not in dec.stack:
             chain.append(self)
-            dec.write(" = ".join(map(str, chain)))
-            chain[:] = []
+            dec.suite.add_statement(AssignStatement(chain))
+            dec.assignment_chain = []
     def on_pop(self, dec):
         dec.write(str(self))
 
@@ -662,6 +666,31 @@ class PyStatement:
         self.display(istr)
         return str(istr)
 
+class DocString(PyStatement):
+    def __init__(self, string):
+        self.string = string
+    def display(self, indent):
+        if '\n' not in self.string:
+            indent.write(repr(self.string))
+        else:
+            if "'''" not in self.string:
+                fence = "'''"
+            elif '"""' not in self.string:
+                fence = '"""'
+            else:
+                raise NotImplemented
+            lines = self.string.split('\n')
+            text = '\n'.join(l.encode('unicode_escape').decode()
+                             for l in lines)
+            docstring = "{0}{1}{0}".format(fence, text)
+            indent.write(docstring)
+
+class AssignStatement(PyStatement):
+    def __init__(self, chain):
+        self.chain = chain
+    def display(self, indent):
+        indent.write(" = ".join(map(str, self.chain)))
+
 class InPlaceOp(PyStatement):
     def __init__(self, left, right):
         self.right = right
@@ -781,10 +810,11 @@ class DecorableStatement(PyStatement):
     def __init__(self):
         self.decorators = []
     def display(self, indent):
-        # indent.write("") # Empty line
+        indent.sep()
         for f in reversed(self.decorators):
             indent.write("@{}", f)
         self.display_undecorated(indent)
+        indent.sep()
     def decorate(self, f):
         self.decorators.append(f)
 
@@ -795,6 +825,11 @@ class DefStatement(FunctionDefinition, DecorableStatement):
     def display_undecorated(self, indent):
         paramlist = ", ".join(self.getparams())
         indent.write("def {}({}):", self.code.name, paramlist)
+        # Assume that co_consts starts with None unless the function
+        # has a docstring, in which case it starts with the docstring
+        if self.code.consts[0] != PyConst(None):
+            docstring = self.code.consts[0].val
+            DocString(docstring).display(indent + 1)
         self.code.get_suite().display(indent + 1)
     def store(self, dec, dest):
         self.name = dest
@@ -880,10 +915,10 @@ class ClassStatement(DecorableStatement):
             indent.write("class {}({}):", self.name, all_args)
         else:
             indent.write("class {}:", self.name)
-        suite = self.func.code.get_suite()
-        # TODO: find out why sometimes the class suite ends with
-        # "return __class__"
+        suite = self.func.code.get_suite(look_for_docstring=True)
         if suite:
+            # TODO: find out why sometimes the class suite ends with
+            # "return __class__"
             last_stmt = suite[-1]
             if isinstance(last_stmt, SimpleStatement):
                 if last_stmt.val.startswith("return "):
@@ -899,6 +934,8 @@ class Suite:
         return len(self.statements)
     def __getitem__(self, i):
         return self.statements[i]
+    def __setitem__(self, i, val):
+        self.statements[i] = val
     def __str__(self):
         istr = IndentString()
         self.display(istr)
