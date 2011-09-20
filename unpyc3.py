@@ -109,7 +109,8 @@ def decompile(obj):
     if inspect.isfunction(obj):
         code = Code(obj.__code__)
         defaults = obj.__defaults__
-        return DefStatement(code, defaults, obj.__closure__)
+        kwdefaults = obj.__kwdefaults__
+        return DefStatement(code, defaults, kwdefaults, obj.__closure__)
     elif inspect.ismodule(obj):
         return dec_module(obj.__file__)
     else:
@@ -548,20 +549,34 @@ class PyCallFunction(PyExpr):
         return "{}({})".format(funcstr, ", ".join(args))
 
 class FunctionDefinition:
-    def __init__(self, code, default_arguments, closure):
+    def __init__(self, code, defaults, kwdefaults, closure):
         self.code = code
-        self.default_arguments = default_arguments
+        self.defaults = defaults
+        self.kwdefaults = kwdefaults
         self.closure = closure
     def getparams(self):
         code_obj = self.code.code_obj
         l = code_obj.co_argcount
         params = list(code_obj.co_varnames[:l])
-        if self.default_arguments:
-            for i, arg in enumerate(reversed(self.default_arguments)):
+        if self.defaults:
+            for i, arg in enumerate(reversed(self.defaults)):
                 params[-i - 1] = "{}={}".format(params[-i - 1], arg)
+        kwcount = code_obj.co_kwonlyargcount
+        kwparams = []
+        if kwcount:
+            for i in range(kwcount):
+                name = code_obj.co_varnames[l + i]
+                if name in self.kwdefaults:
+                    kwparams.append("{}={}".format(name, self.kwdefaults[name]))
+                else:
+                    kwparams.append(name)
+            l += kwcount
         if code_obj.co_flags & VARARGS:
             params.append("*" + code_obj.co_varnames[l])
             l += 1
+        elif kwparams:
+            params.append("*")
+        params.extend(kwparams)
         if code_obj.co_flags & VARKEYWORDS:
             params.append("**" + code_obj.co_varnames[l])
         return params
@@ -579,8 +594,8 @@ class PyComp(PyExpr):
     Abstraction for list, set, dict comprehensions and generator expressions
     """
     precedence = 16
-    def __init__(self, code, default_args, closure):
-        assert not default_args
+    def __init__(self, code, defaults, kwdefaults, closure):
+        assert not defaults and not kwdefaults
         self.code = code
         code[0].change_instr(NOP)
         last_i = len(code.instr_seq) - 1
@@ -608,7 +623,7 @@ class PyDictComp(PyComp):
 class PyGenExpr(PyComp):
     precedence = 16
     pattern = "({})"
-    def __init__(self, code, default_args, closure):
+    def __init__(self, code, defaults, kwdefaults, closure):
         self.code = code
 
 class PyYield(PyExpr):
@@ -819,8 +834,8 @@ class DecorableStatement(PyStatement):
         self.decorators.append(f)
 
 class DefStatement(FunctionDefinition, DecorableStatement):
-    def __init__(self, code, default_arguments, closure):
-        FunctionDefinition.__init__(self, code, default_arguments, closure)
+    def __init__(self, code, defaults, kwdefaults, closure):
+        FunctionDefinition.__init__(self, code, defaults, kwdefaults, closure)
         DecorableStatement.__init__(self)
     def display_undecorated(self, indent):
         paramlist = ", ".join(self.getparams())
@@ -1565,9 +1580,13 @@ class SuiteDecompiler:
     def MAKE_FUNCTION(self, addr, argc, is_closure=False):
         code = Code(self.stack.pop().val, self.code)
         closure = self.stack.pop() if is_closure else None
-        default_args = self.stack.pop(argc)
+        defaults = self.stack.pop(argc & 0xFF)
+        kwdefaults = {}
+        for i in range(argc >> 8):
+            k, v = self.stack.pop(2)
+            kwdefaults[k.name] = v
         func_maker = code_map.get(code.name, DefStatement)
-        self.stack.push(func_maker(code, default_args, closure))
+        self.stack.push(func_maker(code, defaults, kwdefaults, closure))
     
     def LOAD_CLOSURE(self, addr, i):
         # Push the varname.  It doesn't matter as it is not used for now.
